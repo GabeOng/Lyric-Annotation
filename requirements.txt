@@ -1,0 +1,7 @@
+torch 
+torchaudio 
+librosa 
+numpy
+dali-dataset
+youtube_dl
+yt_dlp
