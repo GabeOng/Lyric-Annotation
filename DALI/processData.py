@@ -3,12 +3,17 @@ import torch
 import torchaudio
 import torchaudio.transforms as T
 import DALI as dali
+#RUN FROM ROOT FOLDER WITH: python -m DALI.processData
 
-ANNOTATION_PATH = "DALI_v2.0/annotations"
-INFO_PATH = "DALI_v2.0/info/DALI_DATA_INFO.gz"
+BASE = os.path.join(os.getcwd(), "DALI/DALI_v1.0/")   # adjust if needed
 
-AUDIO_FOLDER = "audio"
-OUTPUT_FOLDER = "processed"
+## MUST DOWNLOAD DALI DATASET FIRST AND EXTRACT TO DALI/DALI_v1.0/
+ANNOTATION_PATH = os.path.join(BASE, "annotations")
+INFO_PATH = os.path.join(BASE, "info/DALI_DATA_INFO.gz")
+
+BASE_OUTPUT = os.path.join(os.getcwd(), "DALI/DALI_v1.0/")   # adjust if needed
+AUDIO_FOLDER = os.path.join(BASE_OUTPUT, "audio")   # adjust if needed
+OUTPUT_FOLDER = os.path.join(BASE_OUTPUT, "processed")
 
 MAX_SONGS = 100   # limit for testing
 
@@ -22,7 +27,7 @@ print("Loading DALI annotations...")
 
 dataset = dali.get_the_DALI_dataset(ANNOTATION_PATH)
 info = dali.get_info(INFO_PATH)
-
+print("INFO:", info)
 print("Total songs:", len(dataset))
 
 

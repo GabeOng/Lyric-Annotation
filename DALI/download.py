@@ -4,10 +4,17 @@ import DALI as dali
 
 # -------- CONFIG --------
 
-ANNOTATION_PATH = "DALI_v2.0/annotations"
-OUTPUT_AUDIO = "audio"
+BASE = os.path.join(os.getcwd(), "DALI/DALI_v1.0/")   # adjust if needed
 
-MAX_DOWNLOADS = 50   # change later
+## MUST DOWNLOAD DALI DATASET FIRST AND EXTRACT TO DALI/DALI_v1.0/
+ANNOTATION_PATH = os.path.join(BASE, "annotations")
+INFO_PATH = os.path.join(BASE, "info/DALI_DATA_INFO.gz")
+
+BASE_OUTPUT = os.path.join(os.getcwd(), "DALI/DALI_v1.0/")   # adjust if needed
+OUTPUT_AUDIO = os.path.join(BASE_OUTPUT, "audio")   # adjust if needed
+
+
+MAX_DOWNLOADS = 150   # change later
 
 os.makedirs(OUTPUT_AUDIO, exist_ok=True)
 
@@ -56,7 +63,7 @@ for song_id in dataset:
             continue
 
         print("Downloading:", entry.info["title"])
-
+        print(count, "/", MAX_DOWNLOADS)
         ydl.download([url])
 
         count += 1

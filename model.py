@@ -24,7 +24,11 @@ class LyricsDataset(Dataset):
 
         data = torch.load(self.files[idx])
 
-        return data["mfcc"], data["lyrics"]
+        mfcc_poly = data["mfcc_poly"]
+        mfcc_voc = data["mfcc_voc"]
+        lyrics = data.get("lyrics", None)
+
+        return mfcc_poly, mfcc_voc, lyrics
 
 # CNN MODEL
 class CNN(nn.Module):
@@ -34,6 +38,13 @@ class CNN(nn.Module):
         num_classes: number of output tokens/characters
         """
         super(CNN, self).__init__()
+        # Polyphonic branch
+        self.conv1_poly = nn.Conv1d(in_channels=n_mfcc, out_channels=64, kernel_size=3, padding=1)
+        self.conv2_poly = nn.Conv1d(in_channels=64, out_channels=128, kernel_size=3, padding=1)
+        
+        # Vocal Branch
+        self.conv1_voc = nn.Conv1d(in_channels=n_mfcc, out_channels=64, kernel_size=3, padding=1)
+        self.conv2_voc = nn.Conv1d(in_channels=64, out_channels=128, kernel_size=3, padding=1)
 
         # Conv layers
         self.conv1 = nn.Conv1d(in_channels=n_mfcc, out_channels=64, kernel_size=3, padding=1)
@@ -47,9 +58,17 @@ class CNN(nn.Module):
         """
         x: [batch, n_mfcc, time_steps]
         """
-        x = F.relu(self.conv1(x))
-        x = F.relu(self.conv2(x))
-        x = F.relu(self.conv3(x))
+        # --- Poly branch ---
+        p = F.relu(self.poly_conv1(mfcc_poly))
+        p = F.relu(self.poly_conv2(p))
+
+        # --- Vocal branch ---
+        v = F.relu(self.voc_conv1(mfcc_voc))
+        v = F.relu(self.voc_conv2(v))
+
+        # --- Fuse ---
+        x = torch.cat([p, v], dim=1)   # [B, 256, T]
+        x = F.relu(self.fuse_conv(x))  
 
         # transpose for fully connected layer
         x = x.permute(0, 2, 1)  # [batch, time_steps, features]
@@ -64,13 +83,15 @@ if __name__ == "__main__":
     time_steps = 100
     num_classes = 30
 
-    dummy_input = torch.randn(batch_size, n_mfcc, time_steps)
+    mfcc_poly = torch.randn(B, n_mfcc, T)
+    mfcc_voc  = torch.randn(B, n_mfcc, T)
+    #dummy_input = torch.randn(batch_size, n_mfcc, time_steps)
 
     # initialize model
     model = CNN(n_mfcc=n_mfcc, num_classes=num_classes)
 
     # forward pass
-    output = model(dummy_input)
+    output = model(mfcc_poly, mfcc_voc)
 
     print("Output shape:", output.shape)
     # should be [batch_size, time_steps, num_classes]
