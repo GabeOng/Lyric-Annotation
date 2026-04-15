@@ -1,2 +1,13 @@
-DALI/DALI_v1.0/*
+DALI/DALI_v1.0/audio/*
+DALI/DALI_v1.0/1audio-testing/*
+DALI/DALI_v1.0/processed-testing/*
+DALI/DALI_v1.0/processed-training/*
+DALI/DALI_v1.0/processed/*
+DALI/DALI_v1.0/annotations/*
+DALI/DALI_v1.0/info/*
+venv/*
 DALI/DALI_v1.0.zip
+dprctd_pt/*
+model.py
+results/*
+output/*

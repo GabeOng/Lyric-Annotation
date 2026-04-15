@@ -1,97 +1,84 @@
-
-from torch.utils.data import Dataset
-import torch
 import os
-import torch.nn as nn
-import torch.nn.functional as F
-import torchaudio
+import torch
+from collections import defaultdict
+from train import LyricsDataset
 
-# LOAD DATATESET
-class LyricsDataset(Dataset):
+# Build Language Models
 
-    def __init__(self, folder):
 
-        self.files = [
-            os.path.join(folder, f)
-            for f in os.listdir(folder)
-            if f.endswith(".pt")
-        ]
+def build_unigram_lm(dataset):
+    word_counts = defaultdict(int)
+    total_words = 0
 
-    def __len__(self):
-        return len(self.files)
+    for _, _, lyrics in dataset:
+        for word in lyrics.split():
+            word_counts[word] += 1
+            total_words += 1
 
-    def __getitem__(self, idx):
+    lm = {}
+    for word, count in word_counts.items():
+        lm[word] = torch.log(torch.tensor(count / total_words)).item()
 
-        data = torch.load(self.files[idx])
+    return lm
 
-        mfcc_poly = data["mfcc_poly"]
-        mfcc_voc = data["mfcc_voc"]
-        lyrics = data.get("lyrics", None)
 
-        return mfcc_poly, mfcc_voc, lyrics
+def build_bigram_lm(dataset):
+    bigram_counts = defaultdict(int)
+    unigram_counts = defaultdict(int)
 
-# CNN MODEL
-class CNN(nn.Module):
-    def __init__(self, n_mfcc=40, num_classes=30):
-        """
-        n_mfcc: number of MFCC features per frame
-        num_classes: number of output tokens/characters
-        """
-        super(CNN, self).__init__()
-        # Polyphonic branch
-        self.conv1_poly = nn.Conv1d(in_channels=n_mfcc, out_channels=64, kernel_size=3, padding=1)
-        self.conv2_poly = nn.Conv1d(in_channels=64, out_channels=128, kernel_size=3, padding=1)
-        
-        # Vocal Branch
-        self.conv1_voc = nn.Conv1d(in_channels=n_mfcc, out_channels=64, kernel_size=3, padding=1)
-        self.conv2_voc = nn.Conv1d(in_channels=64, out_channels=128, kernel_size=3, padding=1)
+    for _, _, lyrics in dataset:
+        words = lyrics.split()
 
-        # Conv layers
-        self.conv1 = nn.Conv1d(in_channels=n_mfcc, out_channels=64, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv1d(in_channels=64, out_channels=128, kernel_size=3, padding=1)
-        self.conv3 = nn.Conv1d(in_channels=128, out_channels=128, kernel_size=3, padding=1)
+        for i in range(len(words)):
+            unigram_counts[words[i]] += 1
+            if i > 0:
+                bigram = (words[i - 1], words[i])
+                bigram_counts[bigram] += 1
 
-        # Fully connected layer
-        self.fc = nn.Linear(128, num_classes)
+    lm = {}
+    for (w1, w2), count in bigram_counts.items():
+        lm[(w1, w2)] = torch.log(
+            torch.tensor(count / unigram_counts[w1])
+        ).item()
 
-    def forward(self, x):
-        """
-        x: [batch, n_mfcc, time_steps]
-        """
-        # --- Poly branch ---
-        p = F.relu(self.poly_conv1(mfcc_poly))
-        p = F.relu(self.poly_conv2(p))
+    return lm
 
-        # --- Vocal branch ---
-        v = F.relu(self.voc_conv1(mfcc_voc))
-        v = F.relu(self.voc_conv2(v))
+# LM Scoring
 
-        # --- Fuse ---
-        x = torch.cat([p, v], dim=1)   # [B, 256, T]
-        x = F.relu(self.fuse_conv(x))  
 
-        # transpose for fully connected layer
-        x = x.permute(0, 2, 1)  # [batch, time_steps, features]
+def score_with_lm(text, unigram_lm, bigram_lm=None):
+    words = text.split()
+    score = 0.0
 
-        x = self.fc(x)  # [batch, time_steps, num_classes]
+    for i, w in enumerate(words):
+        # unigram
+        score += unigram_lm.get(w, -10.0)
 
-        return F.log_softmax(x, dim=2)
+        # bigram
+        if bigram_lm and i > 0:
+            score += bigram_lm.get((words[i - 1], w), -5.0)
+
+    return score
+
+
+# Save / Load
+
+
+def save_lm(unigram_lm, bigram_lm, path="lm.pt"):
+    torch.save({
+        "unigram": unigram_lm,
+        "bigram": bigram_lm
+    }, path)
+
+
+def load_lm(path="lm.pt"):
+    data = torch.load(path)
+    return data["unigram"], data["bigram"]
+
 
 if __name__ == "__main__":
-    batch_size = 2
-    n_mfcc = 40
-    time_steps = 100
-    num_classes = 30
-
-    mfcc_poly = torch.randn(B, n_mfcc, T)
-    mfcc_voc  = torch.randn(B, n_mfcc, T)
-    #dummy_input = torch.randn(batch_size, n_mfcc, time_steps)
-
-    # initialize model
-    model = CNN(n_mfcc=n_mfcc, num_classes=num_classes)
-
-    # forward pass
-    output = model(mfcc_poly, mfcc_voc)
-
-    print("Output shape:", output.shape)
-    # should be [batch_size, time_steps, num_classes]
+    PROCESSED_FOLDER = "DALI/DALI_v1.0/processed-training/metadata"
+    dataset = LyricsDataset(PROCESSED_FOLDER)
+    unigram_lm = build_unigram_lm(dataset)
+    bigram_lm = build_bigram_lm(dataset)
+    save_lm(unigram_lm, bigram_lm)

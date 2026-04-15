@@ -1,123 +1,131 @@
 import os
-import torch
+import sys
+import signal
 import librosa
 import soundfile as sf
-from concurrent.futures import ProcessPoolExecutor
-import DALI as dali
-from demucs import pretrained
-from demucs.apply import apply_model
-import signal
+import torch
 import multiprocessing as mp
+from tqdm import tqdm
 import numpy as np
-import sys
+import random
 
+import DALI as dali
+from demucs.pretrained import get_model
+from demucs.apply import apply_model
 
-## TODO: PARALLELIZE CPU TO RUN AS SOON AS DEMUCS PRODUCES FIRST BATCH OF STEMS (CURRENTLY CPU STARTS AFTER ALL DEMUCS DONE)
-# -------------------------
 # CONFIG
-# -------------------------
-STOP = mp.Value('b', False)  # Shared flag for graceful shutdown
 
-BASE = os.path.join(os.path.dirname(__file__), "DALI_v1.0/")
+
+mp.set_start_method("spawn", force=True)
+
+STOP = mp.Value('b', False)
+
+BASE = os.path.join(os.path.dirname(__file__), "DALI_v1.0")
 ANNOTATION_PATH = os.path.join(BASE, "annotations")
 AUDIO_FOLDER = os.path.join(BASE, "audio")
-OUTPUT_FOLDER = os.path.join(BASE, "processed")
 
-METADATA_OUT = os.path.join(OUTPUT_FOLDER, "metadata")
-POLY_OUT = os.path.join(OUTPUT_FOLDER, "polyphonic")
-VOCAL_OUT = os.path.join(OUTPUT_FOLDER, "vocals")
-SEGMENT_OUT = os.path.join(OUTPUT_FOLDER, "segments")
+OUTPUT_TRAINING_FOLDER = os.path.join(BASE, "processed-training")
+OUTPUT_TESTING_FOLDER = os.path.join(BASE, "processed-testing")
 
+TRAIN_METADATA_OUT = os.path.join(OUTPUT_TRAINING_FOLDER, "metadata")
+TRAIN_POLY_OUT = os.path.join(OUTPUT_TRAINING_FOLDER, "polyphonic")
+TRAIN_VOCAL_OUT = os.path.join(OUTPUT_TRAINING_FOLDER, "vocals")
+TRAIN_SEGMENT_OUT = os.path.join(OUTPUT_TRAINING_FOLDER, "segments")
 
+TEST_METADATA_OUT = os.path.join(OUTPUT_TESTING_FOLDER, "metadata")
+TEST_POLY_OUT = os.path.join(OUTPUT_TESTING_FOLDER, "polyphonic")
+TEST_VOCAL_OUT = os.path.join(OUTPUT_TESTING_FOLDER, "vocals")
+TEST_SEGMENT_OUT = os.path.join(OUTPUT_TESTING_FOLDER, "segments")
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"Using device: {DEVICE}")
+global DEVICE, DEMUCS_MODEL
 
-DEMUCS_MODEL = pretrained.get_model('htdemucs')
-DEMUCS_MODEL.to(DEVICE)
-DEMUCS_MODEL.eval()
-
-for d in [OUTPUT_FOLDER, POLY_OUT, VOCAL_OUT, SEGMENT_OUT, METADATA_OUT]:
+for d in [
+    OUTPUT_TRAINING_FOLDER, TRAIN_POLY_OUT, TRAIN_VOCAL_OUT, TRAIN_SEGMENT_OUT, TRAIN_METADATA_OUT,
+    OUTPUT_TESTING_FOLDER, TEST_POLY_OUT, TEST_VOCAL_OUT, TEST_SEGMENT_OUT, TEST_METADATA_OUT,
+]:
     os.makedirs(d, exist_ok=True)
 
 TARGET_SR = 16000
+BATCH_SIZE = 4
+NUM_WORKERS = 8
+QUEUE_MAXSIZE = 16
+
+TRAIN_SPLIT = 0.95
+SPLIT_SEED = 42
 
 
-# -------------------------
-# DEMUCS SEPARATION
-# -------------------------
 
-# if stems already exist, skip GPU separation step
-def stems_exist(song_id):
-    return(
-        os.path.exists(os.path.join(POLY_OUT, f"{song_id}.wav")) and
-        os.path.exists(os.path.join(VOCAL_OUT, f"{song_id}.wav"))
-    )
+SENTINEL = None
+
+# SIGNAL HANDLING
+
+def handle_sigint(signum, frame):
+    print("\n[STOP REQUESTED]")
+    STOP.value = True
+
+signal.signal(signal.SIGINT, handle_sigint)
+
+# SPLITS
+
+def assign_splits(items, train_ratio=TRAIN_SPLIT, seed=SPLIT_SEED):
+    rng = random.Random(seed)
+    ids = [song_id for song_id, _ in items]
+    rng.shuffle(ids)
+    split_idx = int(len(ids) * train_ratio)
+    return set(ids[:split_idx]), set(ids[split_idx:])
 
 
-# Extract vocals using Demucs. Returns (samples, 2) stereo array. Handles mono→stereo conversion and GPU processing.
-def extract_vocals(audio, sr):
-    # mono → stereo
-    x = torch.tensor(audio).float().unsqueeze(0)  # (1, samples)
-    x = x.repeat(2, 1).unsqueeze(0)               # (1, 2, samples)
-    x = x.to(DEVICE)
+def get_dirs_for_split(song_id, train_set):
+    if song_id in train_set:
+        return TRAIN_POLY_OUT, TRAIN_VOCAL_OUT, TRAIN_SEGMENT_OUT, TRAIN_METADATA_OUT
+    else:
+        return TEST_POLY_OUT, TEST_VOCAL_OUT, TEST_SEGMENT_OUT, TEST_METADATA_OUT
 
-    with torch.no_grad():
-        sources = apply_model(DEMUCS_MODEL, x, device=DEVICE)[0]
+# CACHE CHECKS
 
-    vocals = sources[3].cpu().numpy().T   # (samples, 2)
-    return vocals
 
-#Batch processing for demucs
+def metadata_exists(song_id, metadata_out):
+    return os.path.exists(os.path.join(metadata_out, f"{song_id}.pt"))
+
+# DEMUCS
+
+
 def run_demucs_batch(batch_items):
-    """
-    batch_items = list of (song_id, audio_array)
-    """
-    # Convert mono → stereo and pad to same length
     max_len = max(len(audio) for _, audio in batch_items)
 
     batch = []
     for _, audio in batch_items:
         audio = torch.tensor(audio).float()
-        audio = audio.unsqueeze(0).repeat(2, 1)  # (2, samples)
+        audio = audio.unsqueeze(0).repeat(2, 1)
         audio = torch.nn.functional.pad(audio, (0, max_len - audio.shape[1]))
         batch.append(audio)
 
-    batch = torch.stack(batch, dim=0).to(DEVICE)  # (B, 2, max_len)
+    batch = torch.stack(batch).to(DEVICE)
 
     with torch.no_grad():
         sources = apply_model(DEMUCS_MODEL, batch, device=DEVICE)
 
-    # sources shape: (B, 4, 2, samples)
     return sources
 
-def process_demucs_batch(batch_items):
-    sources = run_demucs_batch(batch_items)
+# PRODUCER (GPU)
 
-    for i, (song_id, audio) in enumerate(batch_items):
-        vocals = sources[i, 3].cpu().numpy().T  # (samples, 2)
 
-        # Save polyphonic (original)
-        sf.write(os.path.join(POLY_OUT, f"{song_id}.wav"), audio, TARGET_SR)
-
-        # Save vocals
-        sf.write(os.path.join(VOCAL_OUT, f"{song_id}.wav"), vocals, TARGET_SR)
-
-        print(f"[STEMS] {song_id}")
-
-BATCH_SIZE = 4
-
-def run_demucs_pass(dataset):
+def gpu_producer(dataset, train_set, queue, limit=None):
     items = list(dataset.items())
+    if limit:
+        items = items[:limit]
+
     batch = []
 
-    for song_id, entry in items:
+    for song_id, entry in tqdm(items, desc="GPU Producer"):
         if STOP.value:
-            print("[STOP] Halting Demucs pass.")
-            return
+            break
 
-        if stems_exist(song_id):
-            print(f"[CACHE] {song_id}")
+        poly_out, vocal_out, _, metadata_out = get_dirs_for_split(song_id, train_set)
+
+        # FULL CACHE SKIP
+        if metadata_exists(song_id, metadata_out):
+            print(f"[FULL CACHE] {song_id}")
             continue
 
         youtube_id = entry.info["audio"]["url"]
@@ -128,257 +136,166 @@ def run_demucs_pass(dataset):
             continue
 
         audio, _ = librosa.load(audio_path, sr=TARGET_SR)
-        batch.append((song_id, audio))
+        batch.append((song_id, entry, audio))
 
         if len(batch) == BATCH_SIZE:
-            process_demucs_batch(batch)
+            sources = run_demucs_batch([(sid, a) for sid, _, a in batch])
+
+            for i, (sid, entry, audio) in enumerate(batch):
+                vocals = sources[i, 3].cpu().numpy().T
+
+                sf.write(os.path.join(poly_out, f"{sid}.wav"), audio, TARGET_SR)
+                sf.write(os.path.join(vocal_out, f"{sid}.wav"), vocals, TARGET_SR)
+
+                queue.put((sid, entry))
+
             batch = []
 
-    if batch and not STOP.value:
-        process_demucs_batch(batch)
+    # flush remaining
+    if batch:
+        sources = run_demucs_batch([(sid, a) for sid, _, a in batch])
+        for i, (sid, entry, audio) in enumerate(batch):
+            vocals = sources[i, 3].cpu().numpy().T
 
+            poly_out, vocal_out, _, _ = get_dirs_for_split(sid, train_set)
 
-# -------------------------
-# MFCC EXTRACTION
-# -------------------------
-def extract_mfcc(signal, sr=16000, n_mfcc=40):
-    # Pad short signals so n_fft fits
+            sf.write(os.path.join(poly_out, f"{sid}.wav"), audio, TARGET_SR)
+            sf.write(os.path.join(vocal_out, f"{sid}.wav"), vocals, TARGET_SR)
+
+            queue.put((sid, entry))
+
+    # send stop signals
+    for _ in range(NUM_WORKERS):
+        queue.put(SENTINEL)
+
+# MFCC
+
+def extract_mfcc(signal):
     if len(signal) < 400:
-        signal = librosa.util.fix_length(signal, 400)
+        signal = librosa.util.fix_length(signal, size = 400)
 
     mfcc = librosa.feature.mfcc(
         y=signal,
-        sr=sr,
-        n_mfcc=n_mfcc,
-        n_fft=400,        # 25 ms window
-        hop_length=160,   # 10 ms hop
+        sr=TARGET_SR,
+        n_mfcc=40,
+        n_fft=400,
+        hop_length=160,
         win_length=400
     )
-    # Normalize MFCCs (per song)
+
     mfcc = (mfcc - mfcc.mean(axis=1, keepdims=True)) / (mfcc.std(axis=1, keepdims=True) + 1e-5)
     return torch.tensor(mfcc)
 
+# CONSUMER (CPU)
 
-# -------------------------
-# PROCESS SONG
-# -------------------------
-def process_song_gpu(args):
-    song_id, entry = args
+def process_song_cpu(song_id, entry, train_set):
+    poly_out, vocal_out, segment_out, metadata_out = get_dirs_for_split(song_id, train_set)
 
-    try:
-        youtube_id = entry.info["audio"]["url"]
-        audio_path = os.path.join(AUDIO_FOLDER, youtube_id + ".wav")
+    if metadata_exists(song_id, metadata_out):
+        print(f"[CACHE CPU] {song_id}")
+        return
 
-        if not os.path.exists(audio_path):
-            print(f"[MISSING] {audio_path}")
-            return None
+    audio_path = os.path.join(poly_out, f"{song_id}.wav")
+    vocal_path = os.path.join(vocal_out, f"{song_id}.wav")
 
-        # -------------------------
-        # LOAD AUDIO
-        # -------------------------
-        audio, sr = librosa.load(audio_path, sr=TARGET_SR)
+    if not os.path.exists(audio_path) or not os.path.exists(vocal_path):
+        print(f"[MISSING STEMS] {song_id}")
+        return
 
-        # -------------------------
-        # VOCAL EXTRACTION
-        # -------------------------
-        vocals = extract_vocals(audio, TARGET_SR)
+    audio, _ = librosa.load(audio_path, sr=TARGET_SR)
+    vocals, _ = librosa.load(vocal_path, sr=TARGET_SR)
 
-        # Save raw polyphonic + vocal audio
-        sf.write(os.path.join(POLY_OUT, f"{song_id}.wav"), audio, TARGET_SR)
-        sf.write(os.path.join(VOCAL_OUT, f"{song_id}.wav"), vocals, TARGET_SR)
+    words = entry.annotations["annot"]["words"]
+    segments = []
 
-        # -------------------------
-        # SEGMENT BY LYRICS
-        # -------------------------
-        words = entry.annotations["annot"]["words"]
+    for i, w in enumerate(words):
+        start, end = w["time"]
 
-        segments = []
-        for i, w in enumerate(words):
-            start = w["time"][0]
-            if start is None or end is None:
-                continue
-            if start < 0 or end <= start:
-                continue
-            end = w["time"][1]
-            text = w["text"]
+        if start is None or end is None or end <= start:
+            continue
 
-            s = int(start * TARGET_SR)
-            e = int(end * TARGET_SR)
+        s, e = int(start * TARGET_SR), int(end * TARGET_SR)
+        seg_audio = audio[s:e]
+        seg_vocals = vocals[s:e]
 
-            if e <= s:
-                continue
+        if len(seg_audio) == 0:
+            continue
 
-            seg_audio = audio[s:e]
-            seg_vocals = vocals[s:e]
+        seg_dir = os.path.join(segment_out, song_id)
+        os.makedirs(seg_dir, exist_ok=True)
 
-            seg_dir = os.path.join(SEGMENT_OUT, song_id)
-            os.makedirs(seg_dir, exist_ok=True)
+        sf.write(os.path.join(seg_dir, f"{i:04d}_poly.wav"), seg_audio, TARGET_SR)
+        sf.write(os.path.join(seg_dir, f"{i:04d}_voc.wav"), seg_vocals, TARGET_SR)
 
-            seg_path_poly = os.path.join(seg_dir, f"{i:04d}_poly.wav")
-            seg_path_voc = os.path.join(seg_dir, f"{i:04d}_voc.wav")
+        mfcc_poly = extract_mfcc(seg_audio)
+        mfcc_voc = extract_mfcc(seg_vocals)
 
-            sf.write(seg_path_poly, seg_audio, TARGET_SR)
-            sf.write(seg_path_voc, seg_vocals, TARGET_SR)
+        T = min(mfcc_poly.shape[1], mfcc_voc.shape[1])
+        mfcc_poly = mfcc_poly[:, :T]
+        mfcc_voc = mfcc_voc[:, :T]
 
-            # -------------------------
-            # MFCC EXTRACTION
-            # -------------------------
-            if len(seg_audio) == 0 or len(seg_vocals) == 0:
-                print(f"[EMPTY STEM] {song_id}")
-                return
-            if not np.isfinite(mfcc_poly).all() or not np.isfinite(mfcc_voc).all():
-                print(f"[BAD AUDIO] {song_id}")
-                return
-            mfcc_poly = extract_mfcc(seg_audio, sr=TARGET_SR)
-            mfcc_voc = extract_mfcc(seg_vocals, sr=TARGET_SR)
+        segments.append({
+            "text": w["text"],
+            "start": start,
+            "end": end,
+            "mfcc_poly": mfcc_poly,
+            "mfcc_voc": mfcc_voc,
+        })
 
-            segments.append({
-                "index": i,
-                "text": text,
-                "start": start,
-                "end": end,
-                "mfcc_poly": mfcc_poly,
-                "mfcc_voc": mfcc_voc,
-            })
+    if segments:
+        torch.save({
+            "song_id": song_id,
+            "segments": segments,
+        }, os.path.join(metadata_out, f"{song_id}.pt"))
 
-        # -------------------------
-        # SAVE METADATA
-        # -------------------------
-        torch.save(
-            {
-                "song_id": song_id,
-                "youtube_id": youtube_id,
-                "segments": segments,
-            },
-            os.path.join(METADATA_OUT, f"{song_id}.pt")
-        )
+        print(f"[DONE] {song_id}")
 
-        print(f"[OK] {song_id}")
-        return song_id
-
-    except Exception as e:
-        print(f"[ERROR] {song_id}: {e}")
-        return None
-    
-def process_song_cpu(args):
-    if STOP.value: 
-        return None
-    song_id, entry = args
-
-    try:
-        youtube_id = entry.info["audio"]["url"]
-        audio_path = os.path.join(POLY_OUT, f"{song_id}.wav")
-        vocal_path = os.path.join(VOCAL_OUT, f"{song_id}.wav")
-
-        if not (os.path.exists(audio_path) and os.path.exists(vocal_path)):
-            print(f"[MISSING STEMS] {song_id}")
-            return None
-
-        audio, _ = librosa.load(audio_path, sr=TARGET_SR)
-        vocals, _ = librosa.load(vocal_path, sr=TARGET_SR)
-
-        words = entry.annotations["annot"]["words"]
-        segments = []
-
-        for i, w in enumerate(words):
-            start = w["time"][0]
-            end = w["time"][1]
-            text = w["text"]
-
-            if start is None or end is None:
-                print(f"[BAD TIME] {song_id} word {i}: {w}")
-                continue
-            if start < 0 or end <= start:
-                print(f"[BAD RANGE] {song_id} word {i}: {w}")
-                continue
-
-            s = int(start * TARGET_SR)
-            e = int(end * TARGET_SR)
-            if e <= s:
-                continue
-
-            seg_audio = audio[s:e]
-            seg_vocals = vocals[s:e]
-
-            seg_dir = os.path.join(SEGMENT_OUT, song_id)
-            os.makedirs(seg_dir, exist_ok=True)
-
-            seg_path_poly = os.path.join(seg_dir, f"{i:04d}_poly.wav")
-            seg_path_voc = os.path.join(seg_dir, f"{i:04d}_voc.wav")
-
-            sf.write(seg_path_poly, seg_audio, TARGET_SR)
-            sf.write(seg_path_voc, seg_vocals, TARGET_SR)
-
-            mfcc_poly = extract_mfcc(seg_audio, sr=TARGET_SR)
-            mfcc_voc = extract_mfcc(seg_vocals, sr=TARGET_SR)
-
-            segments.append({
-                "index": i,
-                "text": text,
-                "start": start,
-                "end": end,
-                "mfcc_poly": mfcc_poly,
-                "mfcc_voc": mfcc_voc,
-            })
-
-        torch.save(
-            {
-                "song_id": song_id,
-                "youtube_id": youtube_id,
-                "segments": segments,
-            },
-            os.path.join(METADATA_OUT, f"{song_id}.pt")
-        )
-
-        print(f"[OK CPU] {song_id}")
-        return song_id
-
-    except Exception as e:
-        print(f"[ERROR CPU] {song_id}: {e}")
-        return None
-
-
-def handle_sigint(signum, frame):
-    print("\n[STOP REQUESTED] Finishing current tasks...")
-    STOP.value = True
-
-signal.signal(signal.SIGINT, handle_sigint)
-
-
-# -------------------------
-# MAIN
-# -------------------------
-if __name__ == "__main__":
-    limit = None
-    if len(sys.argsv[1]) > 1:
+def cpu_consumer(queue, train_set):
+    while True:
         try:
-            limit = int(sys.argv[1])
-            if limit > 0:
-                print(f"Processing only first {limit} songs (for testing)")
-            else:
-                limit = None
-        except ValueError:
-            print("Invalid argument. Expected an integer.")
+            if STOP.value:
+                break
 
+            item = queue.get()
+
+            if item is SENTINEL:
+                break
+
+            song_id, entry = item
+            process_song_cpu(song_id, entry, train_set)
+        except Exception as e:
+            print(f"[ERROR] {song_id}: {e}")
+
+# MAIN
+
+if __name__ == "__main__":
+    limit = int(sys.argv[1]) if len(sys.argv) > 1 else None
+
+
+    DEVICE = "mps" if torch.mps.is_available() else "cpu"
+    DEVICE = "cuda" if torch.cuda.is_available() else DEVICE
+    print(f"Using device: {DEVICE}")
+
+    print("[INIT] Loading Demucs model...")
+    DEMUCS_MODEL = get_model("htdemucs").to(DEVICE)
+    DEMUCS_MODEL.eval()
 
     dataset = dali.get_the_DALI_dataset(ANNOTATION_PATH)
     items = list(dataset.items())
 
-    print(f"Total songs: {len(items)}")
+    train_set, _ = assign_splits(items)
 
-    # --------- PASS 1: Demucs (GPU, single process) ---------
-    print("Running Demucs separation pass...")
-    run_demucs_pass(dataset)
+    queue = mp.Queue(maxsize=QUEUE_MAXSIZE)
 
-    # --------- PASS 2: Segmentation + MFCC (CPU, parallel) ---------
-    tasks = [(song_id, entry) for song_id, entry in items]
-    
-    print(f"Processing {len(tasks)} songs in CPU pool...")
+    consumers = []
+    for _ in range(NUM_WORKERS):
+        p = mp.Process(target=cpu_consumer, args=(queue, train_set))
+        p.start()
+        consumers.append(p)
 
-    
-    try:
-        with ProcessPoolExecutor(max_workers=8) as ex: # <- Adjust number of workers based on your CPU cores
-            for _ in ex.map(process_song_cpu, tasks[:limit] if limit else tasks):
-                pass
-    except KeyboardInterrupt:
-        print("\n[INTERRUPT] Stopping processing...")
+    gpu_producer(dataset, train_set, queue, limit)
+
+    for p in consumers:
+        p.join()
+
+    print("Pipeline complete.")
