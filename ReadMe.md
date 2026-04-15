@@ -7,6 +7,3 @@
 4. run train.py, this will train the model. you can adjust the number of epochs, batch size, and learning rate at the bottom in the function call
 
 5. run evaluate.py, this will evaluate the model by running it on all the songs and computing the wer for each, then compute the average wer at the end. We could potentially use bleu score to evaluate this in the future.
-
-also, right now it only tests on the training data, we have no training/testing data split yet.
-
